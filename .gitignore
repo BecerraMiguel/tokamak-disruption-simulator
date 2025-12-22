@@ -1,0 +1,44 @@
+# Byte-compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+
+# Data files (large datasets should not be in version control)
+data/*.h5
+data/*.hdf5
+data/*.csv
+!data/README.md
+
+# Results (regeneratable)
+results/*.png
+results/*.pdf
+results/figures/*.png
+!results/README.md
+
+# Log files
+*.log
+logs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Test cache
+.pytest_cache/
+.coverage
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

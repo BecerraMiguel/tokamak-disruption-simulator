@@ -1,0 +1,116 @@
+# Tokamak Disruption Simulator - Dataset Generation Configuration
+# 
+# This file configures the synthetic data generation pipeline.
+# Copy and modify for custom configurations.
+
+# General settings
+general:
+  project_name: "tokamak_disruption_dataset"
+  random_seed: 42
+  output_dir: "data"
+  
+# Dataset composition
+dataset:
+  n_shots_total: 1000
+  disruptive_fraction: 0.5  # Fraction of disruptive shots (0.0 to 1.0)
+  
+# Sampling configuration
+sampling:
+  frequency_hz: 10000  # Sampling frequency in Hz
+  window_duration_s: 0.5  # Duration of signal window in seconds
+  
+# Signal configuration
+signals:
+  - name: "ip"
+    description: "Plasma current"
+    unit: "A"
+  - name: "beta_n"
+    description: "Normalized beta"
+    unit: "-"
+  - name: "q95"
+    description: "Safety factor at 95% flux surface"
+    unit: "-"
+  - name: "n_e"
+    description: "Line-averaged electron density"
+    unit: "m^-3"
+  - name: "li"
+    description: "Internal inductance"
+    unit: "-"
+
+# DINA configuration (used when DINA is available)
+dina:
+  enabled: false  # Set to true when DINA is installed
+  device: "ITER"
+  scenario_duration_s: 10.0
+  
+  # Parameter ranges for scenario variation
+  parameter_ranges:
+    ip_ma: [12.0, 15.0]  # Plasma current range [MA]
+    density_fraction: [0.4, 0.9]  # Greenwald fraction range
+    beta_n: [1.5, 3.0]  # Beta_N range
+    
+# DREAM configuration (used when DREAM is available)
+dream:
+  enabled: false  # Set to true when DREAM is installed
+  
+  # Thermal quench parameters
+  thermal_quench:
+    duration_s: 1.0e-3
+    transport_coefficient: 100.0  # m^2/s
+    
+  # Current quench parameters
+  current_quench:
+    duration_s: 50.0e-3
+    wall_time_s: 100.0e-3
+
+# Phenomenological model configuration (fallback when DINA/DREAM unavailable)
+phenomenological:
+  enabled: true  # Automatically used when DINA/DREAM unavailable
+  
+  # ITER-like device parameters
+  device:
+    major_radius_m: 6.2
+    minor_radius_m: 2.0
+    toroidal_field_t: 5.3
+    plasma_current_ma: 15.0
+    
+  # Normal shot parameters
+  normal_shot:
+    duration_s: 1.0
+    noise_level: 0.02  # Relative noise amplitude
+    
+  # Disruptive shot parameters
+  disruptive_shot:
+    precursor_duration_s: 0.3
+    thermal_quench_duration_s: 1.0e-3
+    current_quench_duration_s: 50.0e-3
+    
+  # Disruption causes and probabilities
+  disruption_causes:
+    - type: "density_limit"
+      probability: 0.4
+    - type: "beta_limit"
+      probability: 0.3
+    - type: "q95_limit"
+      probability: 0.2
+    - type: "vde"
+      probability: 0.1
+
+# Operational limits for disruption triggering
+operational_limits:
+  greenwald_fraction_max: 0.95  # n_e / n_G threshold
+  beta_n_max: 3.2  # Beta_N threshold
+  q95_min: 2.2  # Minimum q95 threshold
+
+# Output format configuration
+output:
+  format: "hdf5"
+  compression: "gzip"
+  compression_level: 4
+  include_metadata: true
+  
+# Logging configuration  
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/generation.log"
+  console: true

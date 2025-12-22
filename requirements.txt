@@ -1,0 +1,40 @@
+# Tokamak Disruption Simulator - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Data Storage
+h5py>=3.8.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Machine Learning (for dataset validation)
+scikit-learn>=1.2.0
+
+# Progress Bars
+tqdm>=4.65.0
+
+# Configuration Management
+PyYAML>=6.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Code Quality
+flake8>=6.0.0
+black>=23.0.0
+mypy>=1.3.0
+
+# Jupyter Notebooks
+jupyter>=1.0.0
+ipykernel>=6.22.0
+
+# Optional: DREAM Python Interface
+# Note: DREAM must be installed separately from source
+# See docs/INSTALLATION.md for instructions
