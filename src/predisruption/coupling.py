@@ -23,7 +23,7 @@ from typing import Callable
 import numpy as np
 
 from .equilibrium import EquilibriumSolver
-from .transport import TransportSolver, TransportState
+from .transport import SimplifiedTransport, TransportSolver, TransportState
 
 
 class CoupledSimulator:
@@ -328,6 +328,162 @@ class CoupledSimulator:
         a     = eq_sig.get("a_minor", ITER_PARAMS["a_minor"])
         f_GW  = tr_state.greenwald_fraction(Ip_MA, a)
         f_GW_arr.append(f_GW)
+
+    def run_with_torax(
+        self,
+        t_end: float,
+        Ip_waveform: Callable[[float], float],
+        P_heat_waveform: Callable[[float], float],
+        n_target_waveform: Callable[[float], float] | None = None,
+        n_eq_steps: int = 10,
+        transport_model: str = "constant",
+    ) -> dict:
+        """
+        Run coupled simulation using TORAX for transport (full-run mode).
+
+        Strategy:
+        1. Pre-compute N equilibria at evenly spaced time points using
+           FreeGSNKE + SimplifiedTransport for betap feedback
+        2. Write GEQDSK files for each equilibrium
+        3. Run TORAX once with time-dependent geometry
+        4. Return trajectory with TORAX profiles
+
+        Parameters
+        ----------
+        t_end              : float, end time (s)
+        Ip_waveform        : callable(t) → Ip (A)
+        P_heat_waveform    : callable(t) → P_heat (W)
+        n_target_waveform  : callable(t) → n_e_target (m^-3), or None
+        n_eq_steps         : int, number of equilibrium time points
+        transport_model    : str, TORAX transport model ('constant', 'qlknn', etc.)
+
+        Returns
+        -------
+        trajectory : dict with time-series arrays (same format as run())
+        """
+        if self.tr.backend != "torax":
+            raise RuntimeError("run_with_torax() requires the TORAX transport backend.")
+
+        if self.verbose:
+            print(f"[Coupling] TORAX full-run: pre-computing {n_eq_steps} equilibria...")
+
+        # Phase 1: Pre-compute equilibria using simplified transport for betap
+        simple_tr = SimplifiedTransport(n_rho=self.tr.n_rho)
+        dt_eq = t_end / n_eq_steps
+        geometry_files = {}
+
+        # Initial equilibrium
+        Ip0 = Ip_waveform(0.0)
+        eq = self.eq.solve_static(Ip=Ip0, betap=0.5, xpoints=[(6.0, -3.8)])
+        eq_signals = self.eq.get_signals(eq)
+
+        n0 = n_target_waveform(0.0) if n_target_waveform else 1.0e20
+        tr_state = simple_tr.init(Ip0, T_e0_keV=20.0, n_e0_m3=n0, geometry=eq_signals)
+
+        # Write initial GEQDSK
+        fname = "eq_t0000.geqdsk"
+        self.eq.write_geqdsk(os.path.join(self._geqdsk_dir, fname), eq)
+        geometry_files[0.0] = fname
+
+        # Initialise dynamic solver
+        self.eq.init_dynamic(eq, betap=0.5, Ip=Ip0)
+
+        eq_signals_list = [eq_signals]
+
+        for i in range(1, n_eq_steps + 1):
+            t = i * dt_eq
+
+            # Simple transport step for betap feedback
+            sources = {
+                "P_aux_W": P_heat_waveform(t),
+                "P_ohm_W": 0.0,
+                "n_target": n_target_waveform(t) if n_target_waveform else None,
+            }
+            tr_state = simple_tr.step(tr_state, eq_signals, sources, dt_eq)
+
+            # Extract betap for equilibrium feedback
+            profile_params = self.tr.extract_freegsnke_profiles(tr_state, eq_signals)
+            betap_new = profile_params["betap"]
+
+            # Equilibrium step
+            try:
+                eq = self.eq.step(dt=dt_eq, V_coils={}, betap=betap_new, Ip=Ip_waveform(t))
+                eq_signals = self.eq.get_signals(eq)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"  Equilibrium step failed at t={t:.1f}s: {exc}")
+                break
+
+            # Write GEQDSK
+            fname = f"eq_t{i:04d}.geqdsk"
+            self.eq.write_geqdsk(os.path.join(self._geqdsk_dir, fname), eq)
+            geometry_files[t] = fname
+            eq_signals_list.append(eq_signals)
+
+            if self.verbose and i % max(1, n_eq_steps // 5) == 0:
+                print(f"  t={t:.1f}s  Ip={eq_signals['Ip']*1e-6:.2f}MA"
+                      f"  q95={eq_signals['q95']:.2f}  betap={betap_new:.3f}")
+
+        if self.verbose:
+            print(f"  Pre-computed {len(geometry_files)} equilibria. Running TORAX...")
+
+        # Phase 2: Run TORAX with all geometry files
+        Ip_flat = Ip_waveform(t_end / 2)  # representative Ip
+        P_heat = P_heat_waveform(t_end / 2)
+        torax_states = self.tr.run_trajectory(
+            geometry_dir=self._geqdsk_dir,
+            geometry_files=geometry_files,
+            t_final=t_end,
+            Ip_A=Ip_flat,
+            P_heat_W=P_heat,
+            transport_model=transport_model,
+        )
+
+        if self.verbose:
+            print(f"  TORAX complete: {len(torax_states)} time steps")
+
+        # Phase 3: Build trajectory dict from TORAX states + equilibrium signals
+        rho = np.linspace(0, 1, self.tr.n_rho)
+        record_times = [s.time for s in torax_states]
+        T_e_list = [s.T_e for s in torax_states]
+        n_e_list = [s.n_e for s in torax_states]
+        j_list = [s.j_tor for s in torax_states]
+        q_list = [s.q for s in torax_states]
+        W_arr = [s.W_thermal for s in torax_states]
+
+        # Interpolate equilibrium signals to TORAX time points
+        eq_times = sorted(geometry_files.keys())
+        eq_Ip = [es.get("Ip", np.nan) for es in eq_signals_list]
+        eq_betaN = [es.get("betaN", np.nan) for es in eq_signals_list]
+        eq_q95 = [es.get("q95", np.nan) for es in eq_signals_list]
+
+        Ip_arr = np.interp(record_times, eq_times[:len(eq_Ip)], eq_Ip)
+        betaN_arr = np.interp(record_times, eq_times[:len(eq_betaN)], eq_betaN)
+        q95_arr = np.interp(record_times, eq_times[:len(eq_q95)], eq_q95)
+
+        # Greenwald fraction from TORAX density + equilibrium Ip
+        from .iter_machine import ITER_PARAMS
+        f_GW_arr = []
+        for i, state in enumerate(torax_states):
+            Ip_MA = Ip_arr[i] * 1e-6
+            a = ITER_PARAMS["a_minor"]
+            f_GW_arr.append(state.greenwald_fraction(Ip_MA, a))
+
+        return {
+            "time":            np.array(record_times),
+            "Ip":              np.array(Ip_arr),
+            "betaN":           np.array(betaN_arr),
+            "q95":             np.array(q95_arr),
+            "f_GW":            np.array(f_GW_arr),
+            "W_thermal":       np.array(W_arr),
+            "T_e":             np.column_stack(T_e_list) if T_e_list else np.zeros((self.tr.n_rho, 1)),
+            "n_e":             np.column_stack(n_e_list) if n_e_list else np.zeros((self.tr.n_rho, 1)),
+            "j_tor":           np.column_stack(j_list) if j_list else np.zeros((self.tr.n_rho, 1)),
+            "q_profile":       np.column_stack(q_list) if q_list else np.zeros((self.tr.n_rho, 1)),
+            "rho":             rho,
+            "disruption_time": None,
+            "stopped":         False,
+        }
 
     def cleanup(self):
         """Remove temporary GEQDSK files."""

@@ -301,6 +301,73 @@ FreeGSNKE (local)              SimplifiedTransport (local)
 
 ## WEEK 3-4: Trigger Detection + DREAM Handoff
 
+### Days 15 (partial): TORAX Integration — API Rewrite (COMPLETED)
+
+**Date:** 2026-03-17
+**Status:** ToraxTransport class rewritten with correct TORAX v1.3.0 API. Colab notebook updated with 3 validation tests. Ready to test on Colab.
+
+**Context:** Before starting DREAM handoff work, we needed to verify and fix the TORAX transport backend. The original `ToraxTransport` class in `transport.py` was written speculatively with a completely wrong API — all method calls (`torax.build_sim_from_config`, `runner.run_step`, `runner.update_geometry`) did not exist in the actual TORAX v1.3.0 installation. Research into the installed TORAX source revealed the correct API.
+
+**Key architectural decision: Full-run mode for TORAX**
+
+TORAX is designed for complete trajectory runs via `torax.run_simulation(config)` returning an xarray DataTree. Step-by-step execution exists (experimental API) but is impractical for updating geometry between steps. We adopted a two-phase coupling strategy:
+1. **Phase 1**: Pre-compute N equilibria with FreeGSNKE + SimplifiedTransport (provides betap feedback)
+2. **Phase 2**: Run TORAX once with time-dependent GEQDSK geometry (`geometry_configs` dict)
+
+This means TORAX provides high-fidelity transport profiles given a geometry sequence, while SimplifiedTransport handles the real-time coupling loop for trigger detection.
+
+**Tasks completed:**
+- [x] Researched actual TORAX v1.3.0 API from installed source at `venv/lib/python3.12/site-packages/torax/`
+- [x] Rewrote `ToraxTransport` class with correct API:
+  - `run_full()` → `torax.ToraxConfig.from_dict()` + `torax.run_simulation()`
+  - `datatree_to_states()` → converts xarray DataTree to `TransportState` list
+  - `init()` → thin wrapper running 1-step TORAX sim
+  - `step()` → raises `NotImplementedError` (TORAX is full-run only)
+- [x] Rewrote `_default_iter_torax_config()` to match real TORAX format:
+  - Based on `torax/examples/iterhybrid_rampup.py` reference config
+  - Added all required sections: `pedestal`, `neoclassical`, `time_step_calculator`
+  - Fixed `sources` format (old version used fake `"mode": "MODEL"`)
+  - Added `cocos: 1` for FreeGSNKE GEQDSK compatibility
+  - Supports time-dependent geometry via `geometry_configs`
+  - Parameterised: `geometry_dir`, `geometry_files`, `t_final`, `Ip_A`, `transport_model`
+- [x] Added `run_trajectory()` method to `TransportSolver` (delegates to `run_full()` for TORAX)
+- [x] Added `_deep_merge()` utility for config overrides
+- [x] Added `run_with_torax()` method to `CoupledSimulator`:
+  - Pre-computes N equilibria with FreeGSNKE + SimplifiedTransport
+  - Writes GEQDSK files to temp directory
+  - Runs TORAX once with time-dependent geometry
+  - Returns trajectory dict (same format as `run()`)
+- [x] Updated Colab notebook with 3 progressive TORAX validation tests:
+  - **Test A**: TORAX standalone with built-in ITER hybrid example
+  - **Test B**: TORAX with our FreeGSNKE GEQDSK + comparison vs SimplifiedTransport
+  - **Test C**: TORAX trajectory with time-dependent geometry via `run_with_torax()`
+- [x] Verified all 6 existing tests still pass
+- [x] Verified auto-detection correctly falls back to simplified transport locally
+
+**Key files modified:**
+- `src/predisruption/transport.py` — Rewrote ToraxTransport, config, added run_trajectory()
+- `src/predisruption/coupling.py` — Added run_with_torax(), imported SimplifiedTransport
+- `notebooks/colab_pipeline.ipynb` — Added TORAX test sections, restructured notebook (29 cells)
+
+**TORAX API facts discovered:**
+- Main API: `torax.ToraxConfig.from_dict(config_dict)` + `torax.run_simulation(torax_config)` → `(xr.DataTree, StateHistory)`
+- Output: `data_tree["profiles"].ds` has T_e, T_i, n_e, q, j_total, psi on `rho_cell_norm` grid
+- Scalars: `data_tree["scalars"].ds` has Ip, v_loop_lcfs, W_thermal_total
+- GEQDSK geometry: `geometry_type: 'eqdsk'`, requires `cocos` integer (FreeGSNKE writes COCOS 1)
+- Time-dependent geometry: `geometry_configs: {0.0: {'geometry_file': 'eq_t0.geqdsk'}, ...}`
+- Transport models: `'constant'` (testing), `'bohm-gyrobohm'`, `'qlknn'` (ML-based turbulent)
+
+**Known risks (to verify on Colab):**
+1. COCOS compatibility — FreeGSNKE writes COCOS 1, TORAX converts to COCOS 11 internally with validation. If signs don't match, may need `cocos=3` or similar.
+2. TORAX convergence — our equilibrium has unusual a_minor=1.63m; start with `model_name='constant'` transport before upgrading to `'qlknn'`.
+3. Profile boundary conditions — use `Ip_from_parameters: True` so TORAX uses config Ip, not GEQDSK Ip.
+
+**Next steps:**
+- Push to GitHub and test notebook on Google Colab
+- Once TORAX validated, proceed with Days 15-18 (trigger detection) and Days 19-21 (DREAM handoff)
+
+---
+
 ### Days 15-18: Disruption Trigger Detection (PENDING)
 
 **Goal:** Monitor the coupled FreeGSNKE+TORAX evolution and detect when operational limits are crossed.
@@ -367,6 +434,62 @@ FreeGSNKE (local)              SimplifiedTransport (local)
 
 ---
 
+## Future Implementations
+
+This section collects physics features and engineering improvements that are not needed for the current ML training pipeline but would be required for higher-fidelity simulations.
+
+---
+
+### Plasma Shape Controller (PSC)
+
+"In a real tokamak, a Plasma Shape Controller (PSC) continuously adjusts individual coil voltages in real time to maintain the target shape (keeping the X-point exactly where it should be)."
+
+**Current limitation:**
+The static `inverse_solve` uses isoflux constraints (null-point at the X-point + top-of-plasma boundary point) to pin the plasma to the target lower single-null shape (kappa~1.78, delta~0.32, X-point at R=6.0m, Z=-3.8m). However, when the dynamic solver (`nl_solver.nlstepper`) takes over, these constraints are not re-applied — the solver just finds the nearest GS solution consistent with the current coil currents, which produces a rounder, lower-kappa equilibrium without a well-defined X-point. The shape jumps on the first dynamic step and then stays fixed because no coil voltages are being applied to maintain it.
+
+**How to implement it:**
+The PSC would be a feedback control loop operating at every coupling timestep:
+
+1. **Measure**: After each `nlstepper` call, extract the actual X-point position (R_xpt, Z_xpt) and boundary shape from the new equilibrium.
+2. **Compare**: Compute the shape error relative to the target — X-point displacement Δ(R,Z), elongation error Δkappa, triangularity error Δdelta.
+3. **Control law**: Apply a proportional-integral (PI) controller to compute corrective coil voltages:
+   ```
+   ΔV_i(t) = K_p * e(t) + K_i * integral(e, 0, t)
+   ```
+   where `e(t)` is the shape error vector and the gain matrix `K_p`, `K_i` maps shape errors to individual coil voltage corrections. In practice, this gain matrix is computed from the Jacobian of X-point position with respect to coil currents (already partially available in FreeGSNKE's `dIy/dI` Jacobian).
+4. **Apply**: Pass these corrective voltages as `V_coils` in the next `nlstepper` call.
+
+A simpler first implementation could use just a proportional controller on the vertical position (VS3 coils control vertical stability) and the X-point radial position (PF5/PF6 primarily control X-point height and radial position in ITER).
+
+**Why it's not needed now:**
+For the ML disruption predictor training data, the exact plasma shape at each timestep doesn't need to match the ITER design exactly — the model learns patterns in the profiles (Te, ne, j, q) regardless of the precise boundary shape. The shape change on the first dynamic step is a numerical artifact, not a physical event, and the equilibrium remains self-consistent throughout the simulation.
+
+**Priority:** Low. Implement if higher shape fidelity is needed for the training dataset, or if the project scope expands to include shape-dependent disruption precursors (e.g., locked mode detection which depends on triangularity).
+
+---
+
+### Minor Radius / q95 Correction (Pre-Mass-Generation Fix)
+
+**Current limitation:**
+The FreeGSNKE equilibrium produces a plasma with a_minor = 1.63 m instead of ITER's target a = 2.0 m. Since q95 ∝ a², this gives q95 ≈ 1.7 instead of ~3.0. The q95 < 2.0 disruption trigger cannot be used because the equilibrium *starts* below the threshold — there's no room to approach it from the safe side.
+
+**Physics context — why q95 < 2 is a general limit:**
+The q95 > 2 stability boundary comes from fundamental MHD physics (Kruskal-Shafranov limit), not from ITER's specific design. At q = 2, the m=2/n=1 tearing mode becomes unstable, producing magnetic islands that can lock to the wall and trigger a disruption. This applies to **all tokamaks** (JET, DIII-D, ASDEX-U, KSTAR, etc.). The exact threshold varies slightly with plasma shaping (strongly shaped plasmas can operate transiently at q95 ≈ 1.8), but q95 = 2.0 is the standard conservative limit. Our equilibrium at q95 = 1.7 is mathematically valid (Grad-Shafranov force balance is satisfied) but would be MHD-unstable in reality — our code doesn't detect this because it doesn't solve stability equations. The trigger detector checks q95 numerically, which is sufficient for the pipeline.
+
+**How to fix it:**
+Adjust the isoflux constraints in `src/predisruption/equilibrium.py` to widen the plasma boundary so that a ≈ 2.0 m:
+- Adjust the X-point position (currently R=6.0, Z=-3.8; try R=5.8, Z=-4.2 or similar)
+- Adjust the top-of-plasma constraint (currently R=5.54, Z=3.5)
+- Possibly re-tune coil currents to support the wider equilibrium
+This is a configuration tuning task (estimated: a few hours), not an architectural change.
+
+**When to fix:**
+Before mass data generation (Week 4, Day 22+). Not needed for the Week 3 DREAM handoff work, which can use Greenwald or betaN triggers instead.
+
+**Priority:** Medium. Required before generating q95-triggered disruption scenarios. The other 3 trigger types (Greenwald, betaN, VDE) work independently of this issue.
+
+---
+
 ## Important Decisions Log
 
 | Date | Decision | Rationale |
@@ -378,6 +501,8 @@ FreeGSNKE (local)              SimplifiedTransport (local)
 | 2026-03-10 | Don't restore solver.best_psi after inverse_solve | The solver's "best" iteration often has wrong topology (R~7.8m). Final iteration state has correct axis when null-point constraints are active. |
 | 2026-03-10 | Replace explicit current diffusion with Crank-Nicolson | Explicit scheme CFL limit dt_max=0.02s was 50x below the 1.0s coupling timestep → numerical explosion. Implicit scheme is unconditionally stable. |
 | 2026-03-10 | Use SimplifiedTransport as primary backend for local runs | TORAX requires JAX (incompatible locally). The 0.5D simplified model (IPB98 scaling + parabolic profiles + implicit current diffusion) produces physics-plausible synthetic data adequate for ML training. |
+| 2026-03-17 | TORAX full-run mode (not step-by-step) | TORAX is designed for complete trajectory runs via `run_simulation()`. Step-by-step experimental API exists but is impractical for geometry updates between steps. Strategy: pre-compute FreeGSNKE equilibria → save GEQDSKs → run TORAX once with time-dependent geometry. SimplifiedTransport handles real-time coupling for trigger detection. |
+| 2026-03-17 | q95 < 2 is a universal MHD stability limit | The Kruskal-Shafranov limit (q95 > 2 for kink stability) applies to all tokamaks, not just ITER. Our q95 ≈ 1.7 equilibrium is mathematically valid but MHD-unstable. Fix: widen plasma boundary via isoflux constraints before mass generation. |
 
 ## Problems & Solutions Log
 
@@ -395,6 +520,8 @@ FreeGSNKE (local)              SimplifiedTransport (local)
 | 2026-03-10 | Current profile explodes after 1 step (NaN/Inf) | Explicit diffusion CFL instability: D/drho² * dt = 0.01/(0.02)² * 1.0 = 25 >> 0.5. Replaced with Crank-Nicolson implicit scheme. |
 | 2026-03-10 | betap=729 from transport (should be ~0.7) | Unit bug in extract_freegsnke_profiles: `T_e * 1.602e-16 * 1e3` gives J*1000 instead of J. Removed extra *1e3. |
 | 2026-03-10 | O-point lost at t~84s in long trajectories | FreeGSNKE dynamic solver edge case. Coupling loop catches exception and stops gracefully. Acceptable for current phase. |
+| 2026-03-17 | ToraxTransport class used completely wrong API | Original code called `torax.build_sim_from_config()`, `runner.run_step()`, `runner.update_geometry()` — none exist. Rewrote using actual TORAX v1.3.0 API: `ToraxConfig.from_dict()` + `run_simulation()` returning xarray DataTree. |
+| 2026-03-17 | TORAX config format wrong (sources used `"mode": "MODEL"`) | Real TORAX sources use empty dicts `{}` for defaults or specific params like `P_total`, `gaussian_location`. Rewrote `_default_iter_torax_config()` based on `torax/examples/iterhybrid_rampup.py`. Added missing sections: `pedestal`, `neoclassical`, `time_step_calculator`. |
 
 ## External Dependencies
 
@@ -405,4 +532,4 @@ FreeGSNKE (local)              SimplifiedTransport (local)
 | IMAS Codex MCP | https://github.com/iterorganization/imas-codex | Connected |
 | freegs4e | (dependency of FreeGSNKE) | Installed (venv), patched for single-null bug |
 | FreeGSNKE | https://github.com/FusionComputingLtd/freegsnke | Installed v2.1.0, static+dynamic solve working |
-| TORAX | https://github.com/google-deepmind/torax | To install on Colab (JAX incompatible locally) |
+| TORAX | https://github.com/google-deepmind/torax | v1.3.0 installed in venv (can't run locally — no AVX). API integration complete, pending Colab test. |

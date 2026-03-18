@@ -439,14 +439,18 @@ class SimplifiedTransport:
 
 class ToraxTransport:
     """
-    TORAX 1D transport solver backend.
+    TORAX 1D transport solver backend (full-run mode).
 
-    Wraps the TORAX Python API. Only instantiable when JAX/TORAX are available.
+    TORAX is designed for complete trajectory runs via torax.run_simulation().
+    This class wraps that API and provides conversion to/from TransportState.
+
+    For step-by-step coupling, use SimplifiedTransport locally and TORAX
+    in full-run mode on Colab (pre-compute geometry, run TORAX once).
     """
 
     def __init__(
         self,
-        torax_config: dict,
+        torax_config: dict | None = None,
         n_rho: int = 51,
     ):
         if not torax_available():
@@ -454,57 +458,139 @@ class ToraxTransport:
                 "TORAX/JAX not available on this machine (AVX required). "
                 "Use backend='simplified' or run on Colab."
             )
-        self.config  = torax_config
-        self.n_rho   = n_rho
-        self.rho     = np.linspace(0.0, 1.0, n_rho)
-        self._runner = None
+        self.config_template = torax_config or {}
+        self.n_rho = n_rho
+        self.rho = np.linspace(0.0, 1.0, n_rho)
 
-    def _build_runner(self, geometry_file: str):
-        """Build a TORAX runner from config + initial GEQDSK geometry."""
+    def run_full(
+        self,
+        geometry_dir: str,
+        geometry_files: dict[float, str],
+        t_final: float,
+        Ip_A: float = 15.0e6,
+        T_e0_keV: float = 20.0,
+        n_e0_m3: float = 1.0e20,
+        P_heat_W: float = 33.0e6,
+        transport_model: str = "constant",
+    ) -> tuple:
+        """
+        Run TORAX for a full trajectory with time-dependent GEQDSK geometry.
+
+        Parameters
+        ----------
+        geometry_dir    : str, directory containing GEQDSK files
+        geometry_files  : dict {time_s: filename}, time-dependent geometry
+        t_final         : float, end time (s)
+        Ip_A            : float, plasma current (A)
+        T_e0_keV        : float, initial on-axis Te (keV)
+        n_e0_m3         : float, initial on-axis ne (m^-3)
+        P_heat_W        : float, total heating power (W)
+        transport_model : str, 'constant', 'bohm-gyrobohm', or 'qlknn'
+
+        Returns
+        -------
+        data_tree      : xarray.DataTree with profiles and scalars
+        state_history  : torax.StateHistory for debugging
+        """
         import torax
-        # Update geometry path in config
-        cfg = dict(self.config)
-        if "geometry" in cfg:
-            cfg["geometry"]["geometry_file"] = geometry_file
-        else:
-            cfg["geometry"] = {
-                "geometry_type": "eqdsk",
-                "geometry_file": geometry_file,
-            }
-        self._runner = torax.build_sim_from_config(cfg)
 
-    def init(self, geqdsk_path: str, Ip_A: float, T_e0_keV: float, n_e0_m3: float):
-        """
-        Initialise TORAX with an initial GEQDSK file.
+        config = _default_iter_torax_config(
+            geometry_dir=geometry_dir,
+            geometry_files=geometry_files,
+            t_final=t_final,
+            Ip_A=Ip_A,
+            T_e0_keV=T_e0_keV,
+            P_heat_W=P_heat_W,
+            transport_model=transport_model,
+        )
 
-        Returns an initial TransportState populated from TORAX initial conditions.
+        # Merge any user overrides from config_template
+        config = _deep_merge(config, self.config_template)
+
+        torax_config = torax.ToraxConfig.from_dict(config)
+        data_tree, state_history = torax.run_simulation(torax_config)
+        return data_tree, state_history
+
+    def datatree_to_states(self, data_tree) -> list[TransportState]:
         """
-        self._build_runner(geqdsk_path)
-        # Run one tiny step to get initial profiles
-        torax_output = self._runner.run()
-        return self._torax_output_to_state(torax_output, t=0.0)
+        Convert a TORAX xarray DataTree to a list of TransportState objects.
+
+        Interpolates TORAX profiles onto our uniform n_rho grid.
+        """
+        profiles = data_tree["profiles"].ds
+        scalars = data_tree["scalars"].ds
+
+        times = profiles.coords["time"].values
+        # TORAX uses rho_cell_norm for cell-centered profiles
+        rho_torax = profiles.coords["rho_cell_norm"].values
+
+        states = []
+        for i, t in enumerate(times):
+            T_e = np.interp(self.rho, rho_torax, profiles["T_e"].values[i, :])
+            T_i = np.interp(self.rho, rho_torax, profiles["T_i"].values[i, :])
+            n_e = np.interp(self.rho, rho_torax, profiles["n_e"].values[i, :])
+            j_tor = np.interp(self.rho, rho_torax, profiles["j_total"].values[i, :])
+            psi = np.interp(self.rho, rho_torax, profiles["psi"].values[i, :])
+
+            # q is on face grid (rho_face_norm), interpolate to cell grid
+            if "q" in profiles:
+                rho_face = profiles.coords["rho_face_norm"].values
+                q = np.interp(self.rho, rho_face, profiles["q"].values[i, :])
+            else:
+                q = np.ones(self.n_rho) * 3.0
+
+            W_th = float(scalars["W_thermal_total"].values[i]) if "W_thermal_total" in scalars else 0.0
+
+            states.append(TransportState(
+                rho=self.rho.copy(),
+                T_e=T_e,
+                T_i=T_i,
+                n_e=n_e,
+                j_tor=j_tor,
+                psi=psi,
+                q=q,
+                time=float(t),
+                W_thermal=W_th,
+            ))
+
+        return states
+
+    def init(self, geqdsk_path: str, Ip_A: float, T_e0_keV: float, n_e0_m3: float) -> TransportState:
+        """
+        Initialise transport by running a short (1-step) TORAX simulation.
+
+        Returns an initial TransportState from TORAX output.
+        """
+        import os
+        geometry_dir = os.path.dirname(os.path.abspath(geqdsk_path))
+        geometry_file = os.path.basename(geqdsk_path)
+
+        data_tree, _ = self.run_full(
+            geometry_dir=geometry_dir,
+            geometry_files={0.0: geometry_file},
+            t_final=0.1,
+            Ip_A=Ip_A,
+            T_e0_keV=T_e0_keV,
+            n_e0_m3=n_e0_m3,
+            transport_model="constant",
+        )
+        states = self.datatree_to_states(data_tree)
+        return states[0] if states else TransportState(
+            rho=self.rho.copy(),
+            T_e=np.full(self.n_rho, T_e0_keV),
+            T_i=np.full(self.n_rho, T_e0_keV * 0.9),
+            n_e=np.full(self.n_rho, n_e0_m3),
+            j_tor=np.zeros(self.n_rho),
+            psi=np.zeros(self.n_rho),
+            q=np.ones(self.n_rho) * 3.0,
+        )
 
     def step(self, state: TransportState, geqdsk_path: str, sources: dict, dt: float):
-        """Advance TORAX by dt using updated geometry from geqdsk_path."""
-        import torax
-        # Update geometry (time-dependent geometry support)
-        self._runner.update_geometry(geqdsk_path, t=state.time + dt)
-        torax_output = self._runner.run_step(dt=dt)
-        return self._torax_output_to_state(torax_output, t=state.time + dt)
-
-    def _torax_output_to_state(self, output, t: float) -> TransportState:
-        """Convert TORAX output to TransportState."""
-        core = output.core_profiles
-        return TransportState(
-            rho=np.linspace(0, 1, self.n_rho),
-            T_e=np.interp(self.rho, output.rho, np.array(core.T_e)),
-            T_i=np.interp(self.rho, output.rho, np.array(core.T_i)),
-            n_e=np.interp(self.rho, output.rho, np.array(core.n_e)),
-            j_tor=np.interp(self.rho, output.rho, np.array(core.j_total)),
-            psi=np.interp(self.rho, output.rho, np.array(core.psi)),
-            q=np.interp(self.rho, output.rho, np.array(output.q)),
-            time=t,
-            W_thermal=float(output.W_thermal) if hasattr(output, "W_thermal") else 0.0,
+        """Not supported — TORAX uses full-run mode. Use run_full() instead."""
+        raise NotImplementedError(
+            "ToraxTransport does not support step-by-step execution. "
+            "Use run_full() for trajectory runs, or use SimplifiedTransport "
+            "for step-by-step coupling."
         )
 
 
@@ -551,8 +637,6 @@ class TransportSolver:
         self.backend = backend
 
         if backend == "torax":
-            if torax_config is None:
-                torax_config = _default_iter_torax_config()
             self._impl = ToraxTransport(torax_config, n_rho=n_rho)
         elif backend == "simplified":
             self._impl = SimplifiedTransport(n_rho=n_rho)
@@ -621,6 +705,40 @@ class TransportSolver:
         self._state = new_state
         return new_state
 
+    def run_trajectory(
+        self,
+        geometry_dir: str,
+        geometry_files: dict[float, str],
+        t_final: float,
+        **kwargs,
+    ) -> list[TransportState]:
+        """
+        Run TORAX in full-trajectory mode (TORAX backend only).
+
+        Parameters
+        ----------
+        geometry_dir   : str, directory containing GEQDSK files
+        geometry_files : dict {time_s: filename}
+        t_final        : float, end time (s)
+        **kwargs       : passed to ToraxTransport.run_full()
+
+        Returns
+        -------
+        list of TransportState at each output time step
+        """
+        if self.backend != "torax":
+            raise RuntimeError(
+                "run_trajectory() is only available with the TORAX backend. "
+                "For the simplified backend, use the step() loop."
+            )
+        data_tree, _ = self._impl.run_full(
+            geometry_dir=geometry_dir,
+            geometry_files=geometry_files,
+            t_final=t_final,
+            **kwargs,
+        )
+        return self._impl.datatree_to_states(data_tree)
+
     def extract_freegsnke_profiles(
         self,
         state: TransportState,
@@ -659,53 +777,183 @@ class TransportSolver:
 # Default TORAX config for ITER
 # ---------------------------------------------------------------------------
 
-def _default_iter_torax_config() -> dict:
+def _default_iter_torax_config(
+    geometry_dir: str | None = None,
+    geometry_files: dict[float, str] | None = None,
+    t_final: float = 80.0,
+    Ip_A: float = 15.0e6,
+    T_e0_keV: float = 20.0,
+    P_heat_W: float = 33.0e6,
+    transport_model: str = "constant",
+) -> dict:
     """
     Default TORAX configuration for an ITER-like scenario.
 
-    Uses QLKNN turbulent transport model + standard heating sources.
-    Geometry is provided externally via GEQDSK (updated each coupling step).
+    Based on torax/examples/iterhybrid_rampup.py, adapted for our pipeline.
+    Geometry is provided externally via GEQDSK files from FreeGSNKE.
+
+    Parameters
+    ----------
+    geometry_dir     : directory containing GEQDSK files
+    geometry_files   : dict {time_s: filename} for time-dependent geometry,
+                       or None for single geometry (first file used)
+    t_final          : simulation end time (s)
+    Ip_A             : plasma current (A)
+    T_e0_keV         : initial on-axis electron temperature (keV)
+    P_heat_W         : total heating power (W)
+    transport_model  : 'constant', 'bohm-gyrobohm', or 'qlknn'
     """
-    return {
-        "plasma_composition": {
-            "main_ion": {"D": 0.5, "T": 0.5},
-            "Z_eff": 1.6,
-        },
-        "geometry": {
+    # Build geometry config (time-dependent or static)
+    if geometry_files and len(geometry_files) > 1:
+        # Time-dependent geometry: multiple GEQDSK files
+        geometry_configs = {}
+        for t, fname in geometry_files.items():
+            geometry_configs[t] = {"geometry_file": fname}
+        geometry_cfg = {
             "geometry_type": "eqdsk",
-            # geometry_file is set dynamically by ToraxTransport
-        },
-        "profile_conditions": {
-            "Ip": {0: 15.0e6},      # A, flat-top
-            "T_e": {0.0: {0: 20.0, 1: 0.1}},   # keV, core to edge
-            "T_i": {0.0: {0: 18.0, 1: 0.1}},
-            "n_e": {0.0: {0: 1.0e20, 1: 0.3e20}},
-        },
-        "transport": {
+            "geometry_directory": geometry_dir,
+            "cocos": 1,
+            "Ip_from_parameters": True,
+            "geometry_configs": geometry_configs,
+        }
+    elif geometry_files:
+        # Single GEQDSK file
+        first_file = next(iter(geometry_files.values()))
+        geometry_cfg = {
+            "geometry_type": "eqdsk",
+            "geometry_file": first_file,
+            "geometry_directory": geometry_dir,
+            "cocos": 1,
+            "Ip_from_parameters": True,
+        }
+    else:
+        # Fallback: circular geometry (for testing without GEQDSK)
+        geometry_cfg = {
+            "geometry_type": "circular",
+        }
+
+    # Build transport config based on model choice
+    if transport_model == "qlknn":
+        transport_cfg = {
             "model_name": "qlknn",
+            "apply_inner_patch": True,
+            "chi_i_inner": 1.5,
+            "chi_e_inner": 1.5,
+            "D_e_inner": 0.25,
+            "V_e_inner": 0.0,
+            "rho_inner": 0.3,
+            "apply_outer_patch": True,
+            "chi_i_outer": 2.0,
+            "chi_e_outer": 2.0,
+            "D_e_outer": 0.1,
+            "V_e_outer": 0.0,
+            "rho_outer": 0.9,
+            "DV_effective": True,
             "include_ITG": True,
             "include_TEM": True,
             "include_ETG": True,
+            "avoid_big_negative_s": True,
+        }
+    elif transport_model == "bohm-gyrobohm":
+        transport_cfg = {
+            "model_name": "bohm-gyrobohm",
+            "apply_inner_patch": True,
+            "chi_i_inner": 1.5,
+            "chi_e_inner": 1.5,
+            "rho_inner": 0.3,
+        }
+    else:
+        transport_cfg = {
+            "model_name": "constant",
+        }
+
+    Ip_MA = Ip_A * 1e-6
+
+    return {
+        "plasma_composition": {
+            "main_ion": {"D": 0.5, "T": 0.5},
+            "impurity": "Ne",
+            "Z_eff": 1.6,
         },
+        "profile_conditions": {
+            "Ip": {0: Ip_A},
+            "T_e": {0.0: {0.0: T_e0_keV, 1.0: 0.1}},
+            "T_e_right_bc": 0.1,
+            "T_i": {0.0: {0.0: T_e0_keV * 0.9, 1.0: 0.1}},
+            "T_i_right_bc": 0.1,
+            "n_e_nbar_is_fGW": True,
+            "nbar": 0.85,
+            "n_e": {0: {0.0: 1.5, 1.0: 1.0}},
+            "n_e_right_bc_is_fGW": True,
+            "n_e_right_bc": 0.2,
+        },
+        "geometry": geometry_cfg,
         "numerics": {
-            "t_initial": 0.0,
-            "t_final":   100.0,
-            "fixed_dt":  1.0,
-            "evolve_ion_heat":      True,
+            "t_final": t_final,
+            "fixed_dt": 2,
+            "resistivity_multiplier": 1,
+            "evolve_ion_heat": True,
             "evolve_electron_heat": True,
-            "evolve_density":       True,
-            "evolve_current":       True,
+            "evolve_current": True,
+            "evolve_density": True,
+            "max_dt": 1.0,
+            "chi_timestep_prefactor": 30,
+            "dt_reduction_factor": 3,
         },
-        "solver": {
-            "solver_type": "newton_raphson",
-            "n_corrector_steps": 10,
+        "neoclassical": {
+            "bootstrap_current": {
+                "bootstrap_multiplier": 1.0,
+            },
         },
         "sources": {
-            "ecrh":          {"mode": "MODEL", "P_tot": 20e6},
-            "fusion":        {"mode": "MODEL"},
-            "ohmic":         {"mode": "MODEL"},
-            "bremsstrahlung":{"mode": "MODEL"},
-            "ei_exchange":   {"mode": "MODEL"},
-            "gas_puff":      {"mode": "MODEL"},
+            "generic_current": {
+                "fraction_of_total_current": 0.15,
+                "gaussian_width": 0.075,
+                "gaussian_location": 0.36,
+            },
+            "generic_particle": {},
+            "gas_puff": {},
+            "pellet": {},
+            "generic_heat": {
+                "P_total": P_heat_W,
+                "gaussian_location": 0.13,
+                "gaussian_width": 0.07,
+                "electron_heat_fraction": 1.0,
+            },
+            "fusion": {},
+            "ei_exchange": {},
+            "ohmic": {},
+        },
+        "pedestal": {
+            "model_name": "set_T_ped_n_ped",
+            "set_pedestal": True,
+            "T_i_ped": 1.0,
+            "T_e_ped": 1.0,
+            "n_e_ped_is_fGW": True,
+            "n_e_ped": 0.5,
+            "rho_norm_ped_top": 0.9,
+        },
+        "transport": transport_cfg,
+        "solver": {
+            "solver_type": "newton_raphson",
+            "use_predictor_corrector": True,
+            "n_corrector_steps": 10,
+            "chi_pereverzev": 30,
+            "D_pereverzev": 15,
+            "use_pereverzev": True,
+        },
+        "time_step_calculator": {
+            "calculator_type": "fixed",
         },
     }
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base dict."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
