@@ -814,6 +814,7 @@ def _default_iter_torax_config(
             "geometry_directory": geometry_dir,
             "cocos": 7,
             "Ip_from_parameters": True,
+            "last_surface_factor": 0.95,
             "geometry_configs": geometry_configs,
         }
     elif geometry_files:
@@ -825,6 +826,7 @@ def _default_iter_torax_config(
             "geometry_directory": geometry_dir,
             "cocos": 7,
             "Ip_from_parameters": True,
+            "last_surface_factor": 0.95,
         }
     else:
         # Fallback: circular geometry (for testing without GEQDSK)
