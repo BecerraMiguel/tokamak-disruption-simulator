@@ -812,7 +812,7 @@ def _default_iter_torax_config(
         geometry_cfg = {
             "geometry_type": "eqdsk",
             "geometry_directory": geometry_dir,
-            "cocos": 1,
+            "cocos": 7,
             "Ip_from_parameters": True,
             "geometry_configs": geometry_configs,
         }
@@ -823,7 +823,7 @@ def _default_iter_torax_config(
             "geometry_type": "eqdsk",
             "geometry_file": first_file,
             "geometry_directory": geometry_dir,
-            "cocos": 1,
+            "cocos": 7,
             "Ip_from_parameters": True,
         }
     else:
