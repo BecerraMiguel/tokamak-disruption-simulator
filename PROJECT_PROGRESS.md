@@ -368,12 +368,203 @@ This means TORAX provides high-fidelity transport profiles given a geometry sequ
 
 ---
 
+### Day 15 (continued): TORAX Colab Validation (COMPLETED)
+
+**Date:** 2026-03-23
+**Status:** All 3 TORAX validation tests passing on Google Colab with GPU. Full FreeGSNKE ↔ TORAX coupling demonstrated.
+
+**Context:** Validated the TORAX integration rewritten on Day 15 (API rewrite) by running the Colab notebook. Multiple installation and compatibility issues were discovered and fixed iteratively.
+
+**Colab installation issues fixed (in order of discovery):**
+
+1. **numpy ABI mismatch** — `pip install torax` upgraded numpy .py files to 2.x but left old .so C extensions. Kernel restart loaded mismatched files → `ImportError: numpy._core.multiarray failed to import`. **Fix:** `pip install --force-reinstall --no-deps numpy==<version>` + auto kernel restart via `os.kill(os.getpid(), 9)`.
+
+2. **freegs4e import crash (numba + missing warnings)** — Colab ships numba, which is incompatible with numpy>=2.0. freegs4e's `critical.py` tries `from numba import njit`, fails, then `except ImportError: warnings.warn(...)` crashes because `warnings` was never imported in that file (bug in freegs4e). **Fix:** Inject a fake `numba` module into `sys.modules` with a no-op `njit` decorator before importing freegs4e; also uninstall real numba in install cell.
+
+3. **JAX CUDA plugin version mismatch** — `pip install torax` pulled JAX 0.9.2 but Colab had pre-installed `jax_cuda12_plugin` 0.7.2 (for Colab's default older JAX). PJRT API versions incompatible → `JaxRuntimeError`. **Fix:** Added `pip install jax[cuda12]` to install the matching CUDA plugin for JAX 0.9.2.
+
+4. **Missing deepdiff** — `pip install freegsnke --no-deps` skipped all dependencies including `deepdiff`, which freegsnke imports at load time. **Fix:** Added `deepdiff` to explicit dependency list in install cell.
+
+5. **COCOS mismatch** — Config specified `cocos: 1` but FreeGSNKE writes GEQDSK with sign conventions matching COCOS 7/17. TORAX's `eqdsk` library validated the file data against the declared COCOS and rejected it. **Fix:** Changed to `cocos: 7`.
+
+6. **Flux surface volume monotonicity** — TORAX traces flux surface contours from the magnetic axis outward. Near the separatrix (last ~5% of surfaces), contours in our GEQDSK fail to close properly near the X-point, causing volumes to decrease instead of increase. **Fix:** Set `last_surface_factor=0.75` (stop at 75% of psi_boundary) and `n_surfaces=25`.
+
+7. **Dynamic evolution requires coil_resist** — FreeGSNKE's dynamic solver (`init_dynamic`) needs coil resistance values on the Machine object, which our `tokamak_config.dat` doesn't provide → `AttributeError: 'Machine' object has no attribute 'coil_resist'`. **Fix:** Replaced dynamic evolution with static re-solves at each time point (`solve_static` with updated betap/Ip).
+
+8. **TORAX rho grid mismatch** — TORAX variables live on different grids: `rho_cell_norm` (25 points) vs `rho_face_norm` (27 points). Code assumed all variables on `rho_cell_norm` → `np.interp` length mismatch. **Fix:** Read each variable's actual dimension name via `profiles[var].dims[-1]` and use the matching rho coordinate.
+
+**Test results on Colab:**
+
+| Test | Description | Result | Time |
+|------|-------------|--------|------|
+| A | TORAX standalone (built-in ITER hybrid, 10s) | PASS | 2m13s |
+| B | TORAX with FreeGSNKE GEQDSK + comparison vs SimplifiedTransport | PASS | 1m47s |
+| C | Full coupled trajectory (4 equilibria + TORAX 10s) | PASS | ~10 min |
+
+**Test C results (ITER 15 MA flat-top, 10s, constant transport):**
+
+| Signal | Value | Notes |
+|--------|-------|-------|
+| Ip | 15.0 MA | Constant (prescribed) |
+| q95 | 2.85-2.95 | Much improved over initial 1.72 — static re-solves found better equilibria |
+| betaN | 3.2-4.3 | Crosses betaN=3.2 limit around t=1-2s — TORAX naturally produces disruption-prone conditions |
+| f_GW | 1.5→1.0 | Starts high, decreases — density initialization needs tuning |
+| Te(0) | ~9.5 keV | Realistic ITER-like profile with pedestal |
+| ne(0) | ~1.8×10²⁰ m⁻³ | Peaked profile, realistic shape |
+
+**Key observation from Test C:** q95 jumped from 1.72 (initial) to ~2.9 on the static re-solves at t=3.3s and t=6.7s. This is because the re-solves start from scratch (no topology memory), and with different betap values the solver finds equilibria with larger minor radius. This serendipitously gives us usable q95 values for the trigger system.
+
+**Key files modified:**
+- `notebooks/colab_pipeline.ipynb` — Install cell (two-phase with force-reinstall + auto-restart), fake numba, JAX CUDA, deepdiff, rho grid fixes
+- `src/predisruption/transport.py` — COCOS 7, last_surface_factor=0.75, n_surfaces=25, dynamic rho grid in datatree_to_states
+- `src/predisruption/coupling.py` — Static re-solves instead of dynamic evolution, graceful handling of few equilibria
+
+---
+
+### CRITICAL DESIGN DECISION: Sequential Coupling (FreeGSNKE ↔ TORAX)
+
+**Date:** 2026-03-23
+**Status:** Agreed upon. To be implemented next session.
+
+This section documents the **most important architectural decision** from Day 15 — the coupling strategy between FreeGSNKE (equilibrium) and TORAX (transport). This will be the core of the pre-disruption simulation pipeline.
+
+#### The Problem
+
+In a tokamak, **equilibrium and transport are mutually coupled**:
+
+- The **MHD equilibrium** (shape of flux surfaces, magnetic geometry: grad-rho, volumes, elongation, Shafranov shift) depends on the **pressure and current profiles** (Te, ne, j) — these determine betap, which changes the equilibrium.
+- The **transport** (how Te, ne, j evolve over time) depends on the **geometry** — flux surface volumes, metric coefficients, magnetic shear, safety factor, all come from the equilibrium.
+
+Neither can be solved independently if you want self-consistent physics. In production codes like JINTRAC, ETS, or ASTRA, this is handled by alternating between equilibrium and transport solvers at every time step.
+
+The challenge for us: **TORAX is designed for full trajectory runs** — it takes a config, runs `torax.run_simulation()`, and returns the entire time history. There is no practical way to pause TORAX mid-simulation, update the geometry, and continue.
+
+#### Approach 1 (What we implemented first — "Pre-compute then run")
+
+Pre-compute several equilibria at time snapshots using FreeGSNKE + SimplifiedTransport for betap feedback, then pass all GEQDSK files to a single TORAX run with time-dependent `geometry_configs`. TORAX interpolates geometry between snapshots.
+
+**Limitation:** The geometry is based on the simplified transport's estimate of betap — not on TORAX's own profiles. The geometry and transport are not self-consistent.
+
+#### Approach 2 (What we will implement — "Sequential Coupling")
+
+**This is the agreed-upon method.** Divide the simulation into small time intervals and alternate between FreeGSNKE and TORAX at each interval.
+
+**Algorithm (pseudocode):**
+
+```
+# Parameters
+t_end = 10.0        # total simulation time (s)
+dt_couple = 1.0     # coupling interval (s)
+n_steps = int(t_end / dt_couple)  # number of coupling steps
+
+# Initialization
+eq = FreeGSNKE.solve_static(Ip=15e6, betap=0.5)
+geometry = FreeGSNKE.get_signals(eq)
+write_geqdsk(eq, "eq_t0000.geqdsk")
+
+# Initial TORAX mini-run to get starting profiles
+torax_state = TORAX.run_mini(geqdsk="eq_t0000.geqdsk", t=0→dt_couple)
+
+# Sequential coupling loop
+for i in range(1, n_steps):
+    t_start = i * dt_couple
+    t_end_step = (i + 1) * dt_couple
+
+    # 1. Extract betap from TORAX profiles
+    betap_new = compute_betap(torax_state.Te, torax_state.ne, geometry)
+
+    # 2. FreeGSNKE: re-solve equilibrium with TORAX-derived betap
+    eq = FreeGSNKE.solve_static(Ip=Ip_waveform(t_start), betap=betap_new)
+    geometry = FreeGSNKE.get_signals(eq)
+    write_geqdsk(eq, f"eq_t{i:04d}.geqdsk")
+
+    # 3. TORAX: run 1-second mini-trajectory with updated geometry
+    #    (geometry is held constant during this interval)
+    torax_state = TORAX.run_mini(
+        geqdsk=f"eq_t{i:04d}.geqdsk",
+        t=t_start → t_end_step,
+        initial_profiles=torax_state  # continue from previous state
+    )
+
+    # 4. Check disruption triggers
+    if betaN > 3.2 or q95 < 2.2 or f_GW > 0.95:
+        trigger_time = t_start
+        trigger_state = torax_state
+        break
+
+    # 5. Record trajectory
+    trajectory.append(torax_state)
+```
+
+**Why this is better than Approach 1:**
+
+| Aspect | Approach 1 (pre-compute) | Approach 2 (sequential) |
+|--------|--------------------------|------------------------|
+| Geometry source | SimplifiedTransport betap | TORAX's own betap |
+| Self-consistency | Approximate | Self-consistent (TORAX profiles → FreeGSNKE → geometry → TORAX) |
+| Feedback loop | Open loop (no correction) | Closed loop at each dt_couple |
+| Trigger detection | Post-hoc from TORAX output | Real-time at each step |
+| Computational cost | ~10 min (4 eq + 1 TORAX) | ~30 min (10 eq + 10 TORAX), can be optimized |
+
+**Key implementation details:**
+
+1. **Coupling interval `dt_couple`:** We choose 1 second. The equilibrium changes slowly (on the energy confinement time scale τ_E ≈ 3-4s for ITER), so 1s steps are more than adequate. Shorter steps increase accuracy but also computational cost.
+
+2. **TORAX mini-runs:** Each TORAX call is a "full trajectory run" from `t_start` to `t_start + dt_couple` with **constant geometry** (single GEQDSK file, not time-dependent). The geometry is held frozen during each 1-second interval and only updated at the coupling boundary. This avoids the interpolation complexity and is physically justified because the equilibrium doesn't change significantly in 1 second.
+
+3. **Profile continuity between TORAX runs:** Each TORAX mini-run must start from the profiles at the end of the previous run. This requires passing the final Te(rho), ne(rho), j(rho), psi(rho) from the previous TORAX output as initial conditions for the next run. TORAX supports this via `profile_conditions` in its config.
+
+4. **JAX compilation caching:** The first TORAX call is slow (~2 min) because JAX compiles the simulation functions. Subsequent calls with the same grid size reuse the compiled code and are much faster (~30-60s). The sequential approach benefits from this.
+
+5. **betap extraction from TORAX:** After each TORAX mini-run, extract the volume-averaged pressure from Te and ne profiles:
+   ```
+   <p> = <n_e * T_e + n_i * T_i> (volume average over flux surfaces)
+   betap = 2 * mu_0 * <p> / B_pol^2
+   ```
+   This feeds back into FreeGSNKE for the next equilibrium solve.
+
+6. **Geometry held constant per interval:** Within each 1-second TORAX run, the geometry (flux surface shapes, volumes, metric coefficients) is frozen. This is a standard operator-splitting approach and is accurate as long as dt_couple << τ_E (energy confinement time). For ITER flat-top, τ_E ≈ 3-4s, so dt_couple = 1s gives good accuracy.
+
+7. **Trigger detection at each step:** After each TORAX mini-run, check betaN, q95, f_GW against thresholds. When a trigger fires, the pre-disruption state is immediately available for DREAM handoff — no need to re-run or interpolate.
+
+**Open questions for implementation:**
+
+- **How to pass final TORAX profiles as initial conditions for the next run?** Need to investigate TORAX's `profile_conditions` config to see if it accepts arbitrary initial profiles, or if we need to modify the config dict between runs.
+- **JAX memory management:** Running 10+ TORAX calls sequentially in one Colab session — need to ensure JAX doesn't accumulate GPU memory. May need `jax.clear_caches()` between runs.
+- **Can we avoid re-starting TORAX from scratch each step?** If TORAX has a warm-start mechanism, this would significantly reduce the per-step cost.
+
+**This is the standard approach in integrated tokamak modeling.** It's essentially what JINTRAC, ETS (European Transport Simulator), and ASTRA do — the only difference is they use their own equilibrium solvers (HELENA, ESCO, etc.) instead of FreeGSNKE. Our architecture is:
+
+```
+Sequential Coupling (run_coupled_torax):
+
+  t=0         t=1         t=2         t=3    ...
+   │           │           │           │
+   ▼           ▼           ▼           ▼
+  FreeGSNKE  FreeGSNKE  FreeGSNKE  FreeGSNKE
+  (eq #0)    (eq #1)    (eq #2)    (eq #3)
+   │           │           │           │
+   │ GEQDSK    │ GEQDSK    │ GEQDSK    │ GEQDSK
+   ▼           ▼           ▼           ▼
+  TORAX      TORAX      TORAX      TORAX
+  [0→1s]     [1→2s]     [2→3s]     [3→4s]
+   │           │           │           │
+   │ Te,ne,j   │ Te,ne,j   │ Te,ne,j   │ Te,ne,j
+   │ → betap   │ → betap   │ → betap   │ → betap
+   └───────────┘───────────┘───────────┘
+        ▲
+        │ Check triggers at each step
+```
+
+---
+
 ### Days 15-18: Disruption Trigger Detection (PENDING)
 
 **Goal:** Monitor the coupled FreeGSNKE+TORAX evolution and detect when operational limits are crossed.
 
 **Tasks:**
-- [ ] Implement `TriggerDetector` class in `src/pipeline/` that evaluates disruption criteria at each time step
+- [ ] Implement sequential coupling method `run_coupled_torax()` in `CoupledSimulator` (see design above)
+- [ ] Implement `TriggerDetector` class in `src/pipeline/` that evaluates disruption criteria at each coupling step
 - [ ] Disruption triggers from `configs/generation.yaml`:
   - Greenwald fraction > 0.95 (density limit)
   - βN > 3.2 (beta limit)
@@ -503,6 +694,9 @@ Before mass data generation (Week 4, Day 22+). Not needed for the Week 3 DREAM h
 | 2026-03-10 | Use SimplifiedTransport as primary backend for local runs | TORAX requires JAX (incompatible locally). The 0.5D simplified model (IPB98 scaling + parabolic profiles + implicit current diffusion) produces physics-plausible synthetic data adequate for ML training. |
 | 2026-03-17 | TORAX full-run mode (not step-by-step) | TORAX is designed for complete trajectory runs via `run_simulation()`. Step-by-step experimental API exists but is impractical for geometry updates between steps. Strategy: pre-compute FreeGSNKE equilibria → save GEQDSKs → run TORAX once with time-dependent geometry. SimplifiedTransport handles real-time coupling for trigger detection. |
 | 2026-03-17 | q95 < 2 is a universal MHD stability limit | The Kruskal-Shafranov limit (q95 > 2 for kink stability) applies to all tokamaks, not just ITER. Our q95 ≈ 1.7 equilibrium is mathematically valid but MHD-unstable. Fix: widen plasma boundary via isoflux constraints before mass generation. |
+| 2026-03-23 | FreeGSNKE writes COCOS 7 (not COCOS 1 as assumed) | The `eqdsk` library identifies sign conventions from the GEQDSK data. FreeGSNKE's output matches COCOS 7/17, not COCOS 1. TORAX's config must specify `cocos: 7`. |
+| 2026-03-23 | Use static re-solves (not dynamic evolution) for equilibrium sequence | FreeGSNKE's dynamic solver requires `coil_resist` not available in our machine config, and loses the O-point after ~10s. Static re-solves with updated betap are more robust and adequate for flat-top scenarios. |
+| 2026-03-23 | **Sequential coupling as main approach** | Instead of pre-computing all equilibria then running TORAX once, alternate between FreeGSNKE (1 equilibrium) and TORAX (1-second mini-run) at each coupling step. This gives self-consistent geometry-transport feedback. More expensive (~3x) but physically correct. See "CRITICAL DESIGN DECISION" section for full details. |
 
 ## Problems & Solutions Log
 
@@ -522,6 +716,11 @@ Before mass data generation (Week 4, Day 22+). Not needed for the Week 3 DREAM h
 | 2026-03-10 | O-point lost at t~84s in long trajectories | FreeGSNKE dynamic solver edge case. Coupling loop catches exception and stops gracefully. Acceptable for current phase. |
 | 2026-03-17 | ToraxTransport class used completely wrong API | Original code called `torax.build_sim_from_config()`, `runner.run_step()`, `runner.update_geometry()` — none exist. Rewrote using actual TORAX v1.3.0 API: `ToraxConfig.from_dict()` + `run_simulation()` returning xarray DataTree. |
 | 2026-03-17 | TORAX config format wrong (sources used `"mode": "MODEL"`) | Real TORAX sources use empty dicts `{}` for defaults or specific params like `P_total`, `gaussian_location`. Rewrote `_default_iter_torax_config()` based on `torax/examples/iterhybrid_rampup.py`. Added missing sections: `pedestal`, `neoclassical`, `time_step_calculator`. |
+| 2026-03-23 | numpy ABI mismatch on Colab after pip upgrade | `pip install torax` upgraded numpy .py but left old .so C extensions. Fix: `pip install --force-reinstall --no-deps numpy==<version>` + kernel restart. |
+| 2026-03-23 | freegs4e import crash: numba incompatible with numpy>=2.0 | Colab ships numba which fails with numpy 2.x. freegs4e's except handler uses `warnings.warn()` but `warnings` not imported. Fix: inject fake numba module with no-op `njit`. |
+| 2026-03-23 | JAX CUDA plugin 0.7.2 incompatible with JAX 0.9.2 | Colab's pre-installed cuda plugin was for older JAX. Fix: `pip install jax[cuda12]` to get matching plugin. |
+| 2026-03-23 | TORAX flux surface volumes non-monotonic near edge | Contours near separatrix/X-point fail to close in our GEQDSK. Fix: `last_surface_factor=0.75`, `n_surfaces=25` (stop at 75% of psi_boundary). |
+| 2026-03-23 | TORAX variables on different rho grids (25 vs 27 pts) | `rho_cell_norm` (25 pts) vs `rho_face_norm` (27 pts). Code assumed all on cell grid. Fix: read each variable's actual dimension via `profiles[var].dims[-1]`. |
 
 ## External Dependencies
 
@@ -532,4 +731,4 @@ Before mass data generation (Week 4, Day 22+). Not needed for the Week 3 DREAM h
 | IMAS Codex MCP | https://github.com/iterorganization/imas-codex | Connected |
 | freegs4e | (dependency of FreeGSNKE) | Installed (venv), patched for single-null bug |
 | FreeGSNKE | https://github.com/FusionComputingLtd/freegsnke | Installed v2.1.0, static+dynamic solve working |
-| TORAX | https://github.com/google-deepmind/torax | v1.3.0 installed in venv (can't run locally — no AVX). API integration complete, pending Colab test. |
+| TORAX | https://github.com/google-deepmind/torax | v1.3.0 installed in venv (can't run locally — no AVX). **Validated on Colab** (2026-03-23): GPU working, all 3 tests pass, FreeGSNKE↔TORAX coupling demonstrated. COCOS 7, last_surface_factor=0.75, n_surfaces=25. |
