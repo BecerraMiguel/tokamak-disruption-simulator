@@ -385,9 +385,6 @@ class CoupledSimulator:
         self.eq.write_geqdsk(os.path.join(self._geqdsk_dir, fname), eq)
         geometry_files[0.0] = fname
 
-        # Initialise dynamic solver
-        self.eq.init_dynamic(eq, betap=0.5, Ip=Ip0)
-
         eq_signals_list = [eq_signals]
 
         for i in range(1, n_eq_steps + 1):
@@ -405,13 +402,16 @@ class CoupledSimulator:
             profile_params = self.tr.extract_freegsnke_profiles(tr_state, eq_signals)
             betap_new = profile_params["betap"]
 
-            # Equilibrium step
+            # Static re-solve at new Ip/betap (avoids dynamic solver which
+            # requires coil resistances not always available in machine config)
             try:
-                eq = self.eq.step(dt=dt_eq, V_coils={}, betap=betap_new, Ip=Ip_waveform(t))
+                eq = self.eq.solve_static(
+                    Ip=Ip_waveform(t), betap=betap_new,
+                )
                 eq_signals = self.eq.get_signals(eq)
             except Exception as exc:
                 if self.verbose:
-                    print(f"  Equilibrium step failed at t={t:.1f}s: {exc}")
+                    print(f"  Equilibrium solve failed at t={t:.1f}s: {exc}")
                 break
 
             # Write GEQDSK
