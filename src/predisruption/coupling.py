@@ -424,8 +424,13 @@ class CoupledSimulator:
                 print(f"  t={t:.1f}s  Ip={eq_signals['Ip']*1e-6:.2f}MA"
                       f"  q95={eq_signals['q95']:.2f}  betap={betap_new:.3f}")
 
-        if self.verbose:
-            print(f"  Pre-computed {len(geometry_files)} equilibria. Running TORAX...")
+        if len(geometry_files) < 2:
+            if self.verbose:
+                print(f"  Only {len(geometry_files)} equilibrium succeeded. "
+                      "Using static geometry for TORAX.")
+        else:
+            if self.verbose:
+                print(f"  Pre-computed {len(geometry_files)} equilibria. Running TORAX...")
 
         # Phase 2: Run TORAX with all geometry files
         Ip_flat = Ip_waveform(t_end / 2)  # representative Ip
