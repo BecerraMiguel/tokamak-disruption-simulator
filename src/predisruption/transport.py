@@ -516,26 +516,29 @@ class ToraxTransport:
         Convert a TORAX xarray DataTree to a list of TransportState objects.
 
         Interpolates TORAX profiles onto our uniform n_rho grid.
+        Each variable is read from whichever rho grid it lives on
+        (rho_cell_norm or rho_face_norm — sizes differ by 2).
         """
         profiles = data_tree["profiles"].ds
         scalars = data_tree["scalars"].ds
 
         times = profiles.coords["time"].values
-        # TORAX uses rho_cell_norm for cell-centered profiles
-        rho_torax = profiles.coords["rho_cell_norm"].values
+
+        def _rho_for(var_name):
+            """Return the rho coordinate array for a given variable."""
+            dim = profiles[var_name].dims[-1]
+            return profiles.coords[dim].values
 
         states = []
         for i, t in enumerate(times):
-            T_e = np.interp(self.rho, rho_torax, profiles["T_e"].values[i, :])
-            T_i = np.interp(self.rho, rho_torax, profiles["T_i"].values[i, :])
-            n_e = np.interp(self.rho, rho_torax, profiles["n_e"].values[i, :])
-            j_tor = np.interp(self.rho, rho_torax, profiles["j_total"].values[i, :])
-            psi = np.interp(self.rho, rho_torax, profiles["psi"].values[i, :])
+            T_e = np.interp(self.rho, _rho_for("T_e"), profiles["T_e"].values[i, :])
+            T_i = np.interp(self.rho, _rho_for("T_i"), profiles["T_i"].values[i, :])
+            n_e = np.interp(self.rho, _rho_for("n_e"), profiles["n_e"].values[i, :])
+            j_tor = np.interp(self.rho, _rho_for("j_total"), profiles["j_total"].values[i, :])
+            psi = np.interp(self.rho, _rho_for("psi"), profiles["psi"].values[i, :])
 
-            # q is on face grid (rho_face_norm), interpolate to cell grid
             if "q" in profiles:
-                rho_face = profiles.coords["rho_face_norm"].values
-                q = np.interp(self.rho, rho_face, profiles["q"].values[i, :])
+                q = np.interp(self.rho, _rho_for("q"), profiles["q"].values[i, :])
             else:
                 q = np.ones(self.n_rho) * 3.0
 
